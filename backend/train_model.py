@@ -26,26 +26,27 @@ if _BACKEND_DIR not in sys.path:
 
 def _smoke_test():
     """Quick sanity check: encode a URL and verify tensor shape."""
-    from services.ml_model import encode_url, PhishingCNN
+    from services.ml_model import encode_url, PhishingTransformer
     import torch
 
-    print("\n-- TextCNN smoke-test --")
+    print("\n-- Transformer smoke-test --")
     url   = "http://secure-login.paypal-verify.tk/account/confirm.php"
     token = encode_url(url)
     print(f"  URL    : {url}")
     print(f"  Tensor : shape={tuple(token.shape)}, dtype={token.dtype}")
     print(f"  Tokens : {token[:10].tolist()} ...")
 
-    # Forward pass with a dummy batch
-    model = PhishingCNN()
-    out = model(token.unsqueeze(0))
-    prob = torch.sigmoid(out).item()
+    model = PhishingTransformer()
+    total = sum(p.numel() for p in model.parameters())
+    out   = model(token.unsqueeze(0))
+    prob  = torch.sigmoid(out).item()
+    print(f"  Params : {total:,}")
     print(f"  Untrained P(phishing) = {prob:.3f}  (random weights, expect ~0.5)")
     print()
 
 
 if __name__ == "__main__":
-    print("\nCertAgent -- TextCNN Training Pipeline")
+    print("\nCertAgent -- Transformer Training Pipeline")
     print("=" * 45)
 
     _smoke_test()

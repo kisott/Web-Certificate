@@ -1,18 +1,12 @@
 """
-PhishingCNN -- character-level TextCNN for phishing URL detection.
+PhishingTransformer -- character-level Transformer encoder for phishing URL detection.
 
-Architecture (Kim 2014 / TextCNN adapted to URLs):
+Architecture:
   Input  : URL string, padded to MAX_LEN characters
-  Embed  : each char -> 16-dim vector
-  Conv1D : 3 parallel filters (kernels 3,4,5) x 128 filters each
-  MaxPool: global max over sequence length
-  Concat : 384-dim (128 * 3)
-  FC     : 384 -> 128 -> 1 (sigmoid = P phishing)
-
-Why CNN over MLP:
-  MLP operates on hand-crafted features and hits ~65% accuracy.
-  CNN learns URL sub-string patterns directly (e.g. "login", "secure",
-  ".php?id=", long random tokens) and reaches ~90%+ on URL datasets.
+  Embed  : char embedding (64-dim) + learned positional encoding
+  Encoder: 2 x TransformerEncoderLayer (4 heads, FFN dim 256, dropout 0.1)
+  Pool   : mean pooling over non-padding positions
+  FC     : 64 -> 1  (sigmoid = P phishing)
 
 Usage
 -----
@@ -32,21 +26,21 @@ import torch.nn as nn
 _WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "..", "weights.pth")
 
 # -- Character vocabulary -------------------------------------------------
-# All chars that commonly appear in URLs (lowercased).
 _VOCAB = (
     "abcdefghijklmnopqrstuvwxyz"
     "0123456789"
     "-._~:/?#[]@!$&'()*+,;=%"
 )
-_CHAR2IDX = {c: i + 1 for i, c in enumerate(_VOCAB)}  # 1-indexed; 0 = PAD
-_VOCAB_SIZE = len(_VOCAB) + 1   # +1 for padding token
-_UNK_IDX   = _VOCAB_SIZE        # index for out-of-vocab chars
-_VOCAB_SIZE_TOTAL = _VOCAB_SIZE + 1  # PAD + known + UNK
+_CHAR2IDX      = {c: i + 1 for i, c in enumerate(_VOCAB)}  # 1-indexed; 0 = PAD
+_VOCAB_SIZE    = len(_VOCAB) + 1        # known chars + PAD
+_UNK_IDX       = _VOCAB_SIZE            # out-of-vocab
+_VOCAB_TOTAL   = _VOCAB_SIZE + 1        # PAD + known + UNK
 
-MAX_LEN    = 200   # URLs longer than this are truncated (covers 99%+ of real URLs)
-EMBED_DIM  = 16
-NUM_FILTERS = 128
-KERNEL_SIZES = [3, 4, 5]
+MAX_LEN  = 200
+D_MODEL  = 64
+N_HEADS  = 4
+N_LAYERS = 2
+FFN_DIM  = 256
 
 
 # -- Encoding helper -------------------------------------------------------
@@ -54,80 +48,72 @@ KERNEL_SIZES = [3, 4, 5]
 def encode_url(url: str) -> torch.Tensor:
     """
     Convert a URL / domain string to a padded integer tensor of shape (MAX_LEN,).
-    Characters not in the vocabulary are mapped to UNK_IDX.
     """
     url = url.lower()[:MAX_LEN]
     indices = [_CHAR2IDX.get(c, _UNK_IDX) for c in url]
-    indices += [0] * (MAX_LEN - len(indices))  # right-pad with 0
+    indices += [0] * (MAX_LEN - len(indices))
     return torch.tensor(indices, dtype=torch.long)
 
 
 # -- Model -----------------------------------------------------------------
 
-class PhishingCNN(nn.Module):
+class PhishingTransformer(nn.Module):
     """
-    TextCNN phishing classifier operating on raw URL characters.
+    Lightweight Transformer encoder for character-level URL classification.
 
     forward(x) expects x of shape (batch, MAX_LEN) with integer char indices.
-    Returns a (batch,) tensor of raw logits; apply sigmoid for probability.
+    Returns a (batch,) tensor of raw logits.
     """
 
     def __init__(self):
         super().__init__()
-        self.embedding = nn.Embedding(
-            _VOCAB_SIZE_TOTAL, EMBED_DIM, padding_idx=0
+        self.char_embed = nn.Embedding(_VOCAB_TOTAL, D_MODEL, padding_idx=0)
+        self.pos_embed  = nn.Embedding(MAX_LEN, D_MODEL)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=D_MODEL,
+            nhead=N_HEADS,
+            dim_feedforward=FFN_DIM,
+            dropout=0.1,
+            batch_first=True,
+            norm_first=True,         # Pre-LN: more stable training
         )
-        self.convs = nn.ModuleList([
-            nn.Conv1d(EMBED_DIM, NUM_FILTERS, kernel_size=k, padding=0)
-            for k in KERNEL_SIZES
-        ])
-        self.dropout = nn.Dropout(0.5)
-        total_filters = NUM_FILTERS * len(KERNEL_SIZES)  # 384
-        self.fc = nn.Sequential(
-            nn.Linear(total_filters, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 1),
-        )
+        self.encoder  = nn.TransformerEncoder(encoder_layer, num_layers=N_LAYERS)
+        self.dropout  = nn.Dropout(0.3)
+        self.fc       = nn.Linear(D_MODEL, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (batch, MAX_LEN)
-        emb = self.embedding(x)          # (batch, MAX_LEN, EMBED_DIM)
-        emb = emb.permute(0, 2, 1)       # (batch, EMBED_DIM, MAX_LEN)
+        pad_mask = (x == 0)   # True at padding positions
 
-        pooled = []
-        for conv in self.convs:
-            c = torch.relu(conv(emb))    # (batch, NUM_FILTERS, L)
-            c = c.max(dim=2).values      # (batch, NUM_FILTERS)  global max-pool
-            pooled.append(c)
+        positions = torch.arange(x.size(1), device=x.device).unsqueeze(0)
+        emb = self.char_embed(x) + self.pos_embed(positions)   # (batch, L, D)
 
-        out = torch.cat(pooled, dim=1)   # (batch, 384)
-        out = self.dropout(out)
-        return self.fc(out).squeeze(-1)  # (batch,)
+        out = self.encoder(emb, src_key_padding_mask=pad_mask)  # (batch, L, D)
+
+        # Mean pool over real (non-padding) tokens
+        real = (~pad_mask).float().unsqueeze(-1)                # (batch, L, 1)
+        pooled = (out * real).sum(dim=1) / real.sum(dim=1).clamp(min=1)  # (batch, D)
+
+        pooled = self.dropout(pooled)
+        return self.fc(pooled).squeeze(-1)                      # (batch,)
 
 
 # -- Training --------------------------------------------------------------
 
 def train(epochs: int = 10, batch_size: int = 256, lr: float = 1e-3):
     """
-    Train PhishingCNN on the phishing URL dataset and save weights.pth.
-
-    Parameters
-    ----------
-    epochs     : passes over the training set (10 is usually enough)
-    batch_size : larger batches speed up CNN training significantly
-    lr         : Adam learning rate
+    Train PhishingTransformer on the phishing URL dataset and save weights.pth.
     """
-    import numpy as np
     from sklearn.model_selection import train_test_split
     from torch.utils.data import Dataset, DataLoader
     from services.data_source import load_training_data
 
     print("=" * 55)
-    print("  CertAgent -- TextCNN Phishing Classifier")
+    print("  CertAgent -- Transformer Phishing Classifier")
     print("=" * 55)
 
-    urls, labels = load_training_data()   # list[str], np.ndarray
+    urls, labels = load_training_data()
 
     urls_tr, urls_val, y_tr, y_val = train_test_split(
         urls, labels, test_size=0.2, random_state=42, stratify=labels
@@ -137,10 +123,7 @@ def train(epochs: int = 10, batch_size: int = 256, lr: float = 1e-3):
         def __init__(self, url_list, label_arr):
             self.urls   = url_list
             self.labels = torch.tensor(label_arr, dtype=torch.float32)
-
-        def __len__(self):
-            return len(self.urls)
-
+        def __len__(self): return len(self.urls)
         def __getitem__(self, idx):
             return encode_url(self.urls[idx]), self.labels[idx]
 
@@ -151,14 +134,17 @@ def train(epochs: int = 10, batch_size: int = 256, lr: float = 1e-3):
         URLDataset(urls_val, y_val), batch_size=batch_size, num_workers=0
     )
 
-    model     = PhishingCNN()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    model     = PhishingTransformer()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = nn.BCEWithLogitsLoss()
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, max_lr=lr, steps_per_epoch=len(train_loader), epochs=epochs
     )
 
-    print(f"\nTraining on {len(urls_tr)} URLs, validating on {len(urls_val)}.\n")
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"\nModel parameters : {total_params:,}")
+    print(f"Training samples : {len(urls_tr):,}")
+    print(f"Validation samples: {len(urls_val):,}\n")
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -168,6 +154,7 @@ def train(epochs: int = 10, batch_size: int = 256, lr: float = 1e-3):
             loss   = criterion(logits, yb)
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
             running_loss += loss.item()
@@ -176,8 +163,8 @@ def train(epochs: int = 10, batch_size: int = 256, lr: float = 1e-3):
         correct = total = 0
         with torch.no_grad():
             for xb, yb in val_loader:
-                probs  = torch.sigmoid(model(xb))
-                preds  = (probs >= 0.5).float()
+                probs = torch.sigmoid(model(xb))
+                preds = (probs >= 0.5).float()
                 correct += (preds == yb).sum().item()
                 total   += len(yb)
         avg_loss = running_loss / len(train_loader)
@@ -193,13 +180,13 @@ def train(epochs: int = 10, batch_size: int = 256, lr: float = 1e-3):
 # -- Inference -------------------------------------------------------------
 
 def load_model():
-    """Load trained model. Returns None if weights.pth doesn't exist."""
+    """Load trained model. Returns None if weights.pth does not exist."""
     path = os.path.abspath(_WEIGHTS_PATH)
     if not os.path.exists(path):
         print("[ml_model] weights.pth not found -- run `python train_model.py` first.")
         return None
 
-    model = PhishingCNN()
+    model = PhishingTransformer()
     try:
         state = torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
@@ -209,15 +196,9 @@ def load_model():
     return model
 
 
-def predict_risk(url_or_domain: str, model=None) -> float | None:
+def predict_risk(url_or_domain: str, model=None):
     """
     Return P(phishing) in [0.0, 1.0] for a URL or bare domain string.
-
-    Parameters
-    ----------
-    url_or_domain : e.g. "secure-login.paypal-verify.tk" or "https://..."
-    model         : pre-loaded PhishingCNN (pass to avoid disk reads per call)
-
     Returns None if the model has not been trained yet.
     """
     if model is None:
@@ -225,7 +206,7 @@ def predict_risk(url_or_domain: str, model=None) -> float | None:
     if model is None:
         return None
 
-    x = encode_url(url_or_domain).unsqueeze(0)  # (1, MAX_LEN)
+    x = encode_url(url_or_domain).unsqueeze(0)
     with torch.no_grad():
         logit = model(x)
         prob  = torch.sigmoid(logit).item()
